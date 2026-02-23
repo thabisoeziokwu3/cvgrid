@@ -202,6 +202,16 @@ textarea {
   box-shadow: 0 6px 20px rgba(127, 140, 141, 0.4);
 }
 
+.section {
+  page-break-inside: avoid;
+}
+
+.experience-item,
+.education-item,
+.reference-item {
+  page-break-inside: avoid;
+}
+
 /* Experience and Education Items - REMOVED BLUE BORDER */
 .experience-item,
 .education-item {

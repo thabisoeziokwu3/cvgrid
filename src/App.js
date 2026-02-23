@@ -305,7 +305,8 @@ const waitForImagesAndCapture = (retries = 5) => {
   let allLoaded = true;
 
   for (let i = 0; i < images.length; i++) {
-    if (!images[i].complete) {
+    const img = images[i];
+    if (!img.complete || img.naturalWidth === 0) {
       allLoaded = false;
       break;
     }
@@ -359,40 +360,102 @@ const waitForImagesAndCapture = (retries = 5) => {
     width: cvElement.scrollWidth,
     height: cvElement.scrollHeight,
   })
-    .then((canvas) => {
-      const imgData = canvas.toDataURL('image/png');
-      const pdf = new jsPDF('p', 'mm', 'a4');
-      const pdfWidth = pdf.internal.pageSize.getWidth();
-      const pdfHeight = pdf.internal.pageSize.getHeight();
+  .then((canvas) => {
+    const pdf = new jsPDF('p', 'mm', 'a4');
+    const pdfWidthMm = pdf.internal.pageSize.getWidth();   // ~210
+    const pdfHeightMm = pdf.internal.pageSize.getHeight(); // ~297
 
-      const imgProps = pdf.getImageProperties(imgData);
-      const imgHeightMm = (imgProps.height * pdfWidth) / imgProps.width;
+    const cvElement = document.getElementById('temp-cv-template');
 
-      if (imgHeightMm <= pdfHeight) {
-        pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, imgHeightMm);
-      } else {
-        let position = 0;
-        let remainingHeight = imgHeightMm;
+    // Canvas px height that corresponds to one PDF page height
+    const pageHeightPx = Math.floor(canvas.width * (pdfHeightMm / pdfWidthMm));
 
-        pdf.addImage(imgData, 'PNG', 0, position, pdfWidth, imgHeightMm);
-        remainingHeight -= pdfHeight;
+    // Map DOM pixels -> canvas pixels (because html2canvas uses scale)
+    const domToCanvasScale = canvas.height / cvElement.scrollHeight;
 
-        while (remainingHeight > 0) {
-          position -= pdfHeight;
-          remainingHeight -= pdfHeight;
-          pdf.addPage();
-          pdf.addImage(imgData, 'PNG', 0, position, pdfWidth, imgHeightMm);
-        }
+    // Candidate breakpoints (DOM Y positions)
+    const breakpointEls = cvElement.querySelectorAll(
+      '.section, .experience-item, .education-item, .reference-item'
+    );
+
+    const domBreaks = Array.from(breakpointEls)
+      .map((el) => el.offsetTop)
+      .filter((y) => typeof y === 'number')
+      .sort((a, b) => a - b);
+
+    // Helper: pick a nice break <= targetDomY but > startDomY
+    const pickBreak = (startDomY, targetDomY) => {
+      const minBlock = startDomY + 120;          // don’t create tiny slices
+      const maxAllowed = targetDomY - 40;        // keep some padding
+      let chosen = null;
+
+      for (let i = 0; i < domBreaks.length; i++) {
+        const y = domBreaks[i];
+        if (y >= minBlock && y <= maxAllowed) chosen = y;
+        if (y > maxAllowed) break;
+      }
+      return chosen; // can be null
+    };
+
+    let pageIndex = 0;
+    let startCanvasY = 0;
+
+    while (startCanvasY < canvas.height) {
+      // Default end if we just cut by page height
+      let endCanvasY = Math.min(startCanvasY + pageHeightPx, canvas.height);
+
+      // Try to align cut with a DOM breakpoint
+      const startDomY = startCanvasY / domToCanvasScale;
+      const targetDomY = endCanvasY / domToCanvasScale;
+
+      const chosenDomBreak = pickBreak(startDomY, targetDomY);
+      if (chosenDomBreak) {
+        endCanvasY = Math.min(
+          Math.floor(chosenDomBreak * domToCanvasScale),
+          canvas.height
+        );
       }
 
-      pdf.save(`${packageData.cvData?.personalInfo?.fullName || 'cv'}.pdf`);
+      const sliceHeight = endCanvasY - startCanvasY;
 
-      console.log('✅ CV downloaded successfully with smart auto-sizing and multipage support');
+      // Create a page slice canvas
+      const pageCanvas = document.createElement('canvas');
+      pageCanvas.width = canvas.width;
+      pageCanvas.height = sliceHeight;
 
-      root.unmount();
-      document.body.removeChild(tempContainer);
-      resolve(true);
-    })
+      const ctx = pageCanvas.getContext('2d');
+      ctx.drawImage(
+        canvas,
+        0,
+        startCanvasY,
+        canvas.width,
+        sliceHeight,
+        0,
+        0,
+        canvas.width,
+        sliceHeight
+      );
+
+      const imgData = pageCanvas.toDataURL('image/png');
+
+      if (pageIndex > 0) pdf.addPage();
+
+      // Scale slice to full page width, keep aspect ratio
+      const imgHeightMm = (sliceHeight * pdfWidthMm) / canvas.width;
+      pdf.addImage(imgData, 'PNG', 0, 0, pdfWidthMm, imgHeightMm);
+
+      pageIndex++;
+      startCanvasY = endCanvasY;
+    }
+
+    pdf.save(`${packageData.cvData?.personalInfo?.fullName || 'cv'}.pdf`);
+
+    console.log('✅ CV downloaded with section-aware page breaks');
+
+    root.unmount();
+    document.body.removeChild(tempContainer);
+    resolve(true);
+  })
     .catch((error) => {
       console.error('❌ CV download failed:', error);
       root.unmount();
@@ -4388,22 +4451,20 @@ const generateCoverLetter = useCallback(async () => {
   }, [coverLetter, cvData, coverLetterCompany, coverLetterPosition]);
  
   // Load data from localStorage on component mount
-  useEffect(() => {
-    const savedData = localStorage.getItem('cvData');
-    if (savedData) {
-      setCvData(JSON.parse(savedData));
-    }
- 
-    const savedTemplate = localStorage.getItem('selectedTemplate');
-    if (savedTemplate) {
-      setSelectedTemplate(savedTemplate);
-    }
- 
-    const savedColor = localStorage.getItem('selectedColor');
-    if (savedColor) {
-      setSelectedColor(savedColor);
-    }
-  }, []);
+useEffect(() => {
+  const savedData = localStorage.getItem('cvData');
+  if (savedData) {
+    const parsed = JSON.parse(savedData);
+    setCvData(parsed);
+    setProfileImage(parsed?.profileImage || null); // ✅ restore state from persisted data
+  }
+
+  const savedTemplate = localStorage.getItem('selectedTemplate');
+  if (savedTemplate) setSelectedTemplate(savedTemplate);
+
+  const savedColor = localStorage.getItem('selectedColor');
+  if (savedColor) setSelectedColor(savedColor);
+}, []);
  
   // Save data to localStorage whenever it changes
   useEffect(() => {
@@ -4576,24 +4637,39 @@ const removeReference = useCallback((id) => {
   }));
 }, []);
  
-  const handleImageUpload = useCallback((event) => {
-    const file = event.target.files[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const imageDataUrl = e.target.result;
-        setProfileImage(imageDataUrl);
-      };
-      reader.readAsDataURL(file);
-    }
-  }, []);
- 
-  const removeProfileImage = useCallback(() => {
-    setProfileImage(null);
-    if (fileInputRef.current) {
-      fileInputRef.current.value = '';
-    }
-  }, []);
+const handleImageUpload = useCallback((event) => {
+  const file = event.target.files?.[0];
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const imageDataUrl = e.target.result;
+
+    // 1) Keep UI state
+    setProfileImage(imageDataUrl);
+
+    // 2) Persist into cvData so it survives refresh/payment redirect
+    setCvData((prev) => ({
+      ...prev,
+      profileImage: imageDataUrl,
+    }));
+  };
+  reader.readAsDataURL(file);
+}, []);
+
+const removeProfileImage = useCallback(() => {
+  setProfileImage(null);
+
+  // Persist removal
+  setCvData((prev) => ({
+    ...prev,
+    profileImage: null,
+  }));
+
+  if (fileInputRef.current) {
+    fileInputRef.current.value = '';
+  }
+}, []);
  
   const resetCV = useCallback(() => {
     if (window.confirm('Are you sure you want to reset your CV? All data will be lost.')) {
