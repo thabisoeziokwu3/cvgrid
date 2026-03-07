@@ -657,7 +657,12 @@ const downloadCoverLetterAfterPayment = (packageData) => {
         const dataToUse = packageData.cvData || {};
         const company = packageData.coverLetterCompany || '';
         const position = packageData.coverLetterPosition || '';
-        const fullName = dataToUse.personalInfo?.fullName || 'Your Name';
+        const fullName =
+            dataToUse?.personalInfo?.fullName &&
+            dataToUse.personalInfo.fullName.trim() !== '' &&
+            dataToUse.personalInfo.fullName !== 'Your Name'
+              ? dataToUse.personalInfo.fullName
+              : '';
 
         let rawText = '';
 
@@ -797,6 +802,21 @@ const handlePayment = async () => {
 
     // Get the absolute latest data
     const latestCvData = JSON.parse(localStorage.getItem('cvData') || '{}');
+
+    const applicantName = latestCvData?.personalInfo?.fullName?.trim();
+
+    const hasContent =
+      applicantName ||
+      latestCvData?.professionalSummary?.trim() ||
+      (latestCvData?.workExperience || []).some(item => item.jobTitle || item.company) ||
+      (latestCvData?.education || []).some(item => item.institution || item.degree);
+
+    if (!hasContent) {
+      setCardError('Please complete your CV details before making payment.');
+      setIsProcessing(false);
+      return;
+    }
+
     const savedTemplate = localStorage.getItem('selectedTemplate') || 'Classic Professional';
     const savedColor = localStorage.getItem('selectedColor') || '#2c3e50';
 
@@ -816,41 +836,49 @@ const handlePayment = async () => {
       }),
     });
 
-    const data = await response.json();
+    // Robust response parsing
+    const contentType = response.headers.get('content-type') || '';
+    let data;
+
+    if (contentType.includes('application/json')) {
+      data = await response.json();
+    } else {
+      const rawText = await response.text();
+      console.error('❌ Non-JSON response from payment endpoint:', rawText);
+      throw new Error(
+        response.ok
+          ? 'Payment service returned an invalid response.'
+          : 'Payment service failed before checkout could be created.'
+      );
+    }
+
     console.log('🔎 /api/payment/process response:', data);
 
     if (!response.ok || !data.success || !data.redirectUrl) {
-      throw new Error(data.error || 'Failed to create checkout session');
+      throw new Error(data?.error || 'Failed to create checkout session');
     }
 
     let aiToStore = null;
-
     if (selectedPackage === 'ai') {
-      const aiFromServer =
-        typeof data.aiCoverLetter === 'string'
+      aiToStore =
+        typeof data.aiCoverLetter === 'string' && data.aiCoverLetter.trim()
           ? data.aiCoverLetter.trim()
-          : '';
-
-      aiToStore = aiFromServer || null;
+          : null;
     }
 
     const packageData = {
-      cvData: latestCvData,
+      cvData: latestCvData,               // full live data, WITH image if present
       coverLetterCompany,
       coverLetterPosition,
       packageType: selectedPackage,
       selectedTemplate: savedTemplate,
       selectedColor: savedColor,
       aiCoverLetter: aiToStore,
-      profileImage: latestCvData.profileImage || null,
+      profileImage: latestCvData?.profileImage || null,
       timestamp: Date.now(),
     };
 
-
-    console.log('💾 Saving pendingPackage to localStorage:', packageData);
-
     localStorage.setItem('pendingPackage', JSON.stringify(packageData));
-
     window.location.href = data.redirectUrl;
   } catch (error) {
     console.error('❌ Checkout creation failed:', error);
@@ -4299,6 +4327,13 @@ const CVBuilder = () => {
   const fileInputRef = useRef(null);
   const formContainerRef = useRef(null);
 
+  const persistCvData = useCallback((nextCvData) => {
+  try {
+    localStorage.setItem('cvData', JSON.stringify(nextCvData));
+  } catch (err) {
+    console.error('Failed to persist cvData:', err);
+  }
+}, []);
 
 const generateBasicCoverLetter = useCallback(() => {
   if (!coverLetterCompany || !coverLetterPosition) {
@@ -4476,29 +4511,29 @@ useEffect(() => {
   // Add this to your CVBuilder component or in a useEffect
  
 const handleInputChange = useCallback((section, field, value, index = null) => {
-  setCvData(prevCvData => {
+  setCvData((prev) => {
+    let next = { ...prev };
+
     if (index !== null) {
-      const updatedArray = [...prevCvData[section]];
-      updatedArray[index] = {
-        ...updatedArray[index],
-        [field]: value
+      next[section] = [...(prev[section] || [])];
+      next[section][index] = {
+        ...next[section][index],
+        [field]: value,
       };
-      return { ...prevCvData, [section]: updatedArray };
     } else if (section.includes('.')) {
       const [mainSection, subSection] = section.split('.');
-      return {
-        ...prevCvData,
-        [mainSection]: {
-          ...prevCvData[mainSection],
-          [subSection]: value
-        }
+      next[mainSection] = {
+        ...(prev[mainSection] || {}),
+        [subSection]: value,
       };
     } else {
-      return { ...prevCvData, [section]: value };
+      next[section] = value;
     }
 
+    persistCvData(next);
+    return next;
   });
-}, []);
+}, [persistCvData]);
  
   const addExperience = useCallback(() => {
     setCvData({
@@ -4637,39 +4672,53 @@ const removeReference = useCallback((id) => {
   }));
 }, []);
  
-const handleImageUpload = useCallback((event) => {
-  const file = event.target.files?.[0];
+const handleImageUpload = useCallback((e) => {
+  const file = e.target.files?.[0];
   if (!file) return;
 
   const reader = new FileReader();
-  reader.onload = (e) => {
-    const imageDataUrl = e.target.result;
 
-    // 1) Keep UI state
-    setProfileImage(imageDataUrl);
+  reader.onload = () => {
+    const imageDataUrl = reader.result;
 
-    // 2) Persist into cvData so it survives refresh/payment redirect
-    setCvData((prev) => ({
-      ...prev,
-      profileImage: imageDataUrl,
-    }));
+    setCvData((prev) => {
+      const next = {
+        ...prev,
+        profileImage: imageDataUrl,
+      };
+
+      try {
+        localStorage.setItem('cvData', JSON.stringify(next));
+      } catch (err) {
+        console.error('❌ Failed to save profile image to localStorage:', err);
+      }
+
+      return next;
+    });
   };
+
+  reader.onerror = () => {
+    console.error('❌ Failed to read selected image');
+  };
+
   reader.readAsDataURL(file);
 }, []);
 
 const removeProfileImage = useCallback(() => {
-  setProfileImage(null);
-
-  // Persist removal
-  setCvData((prev) => ({
-    ...prev,
-    profileImage: null,
-  }));
+  setCvData((prev) => {
+    const next = { ...prev, profileImage: null };
+    try {
+      localStorage.setItem('cvData', JSON.stringify(next));
+    } catch (err) {
+      console.error('❌ Failed to clear profile image:', err);
+    }
+    return next;
+  });
 
   if (fileInputRef.current) {
     fileInputRef.current.value = '';
   }
-}, []);
+}, [fileInputRef]);
  
   const resetCV = useCallback(() => {
     if (window.confirm('Are you sure you want to reset your CV? All data will be lost.')) {
